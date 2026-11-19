@@ -1,0 +1,17 @@
+name: buzz-observer
+label: Buzz observer frames (kind 24200)
+kind: standalone
+version: 1.0.0
+description: >
+  Publishes agent observer frames (kind 24200) for real Hermes turns on Buzz, which is what
+  the desktop's per-agent Activity panel, the "working in #channel" badge and phase-1 Stop
+  read. Channel attribution: post_gateway_admission carries source.chat_id; tool hooks resolve
+  the channel from the profile's own state.db session row; cron turns use their job's delivery
+  origin. Owner-only, NIP-44 encrypted, ephemeral: nothing lands in a channel.
+  Kill switch: display.platforms.buzz.observer_activity (default false, re-read every 60 s).
+author: Goose
+provides_hooks:
+  - post_gateway_admission
+  - pre_tool_call
+  - post_tool_call
+  - on_session_end
