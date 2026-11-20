@@ -72,9 +72,11 @@ _TOOL_KINDS = {
 _state_lock = threading.RLock()
 _TURNS: Dict[str, dict] = {}          # session_id -> turn ctx (tool/lifecycle hooks)
 _PENDING: Dict[str, dict] = {}        # session_key -> turn ctx awaiting its session id (admission)
-_service: Optional["_Service"] = None
-_config_cache: Dict[str, Any] = {"at": 0.0, "value": False}
-_evidence_path: Optional[Path] = None
+# Everything below is keyed by profile home: one gateway process serves every seat, so a
+# module-level singleton would sign every seat's frames with whichever key started first.
+_services: Dict[str, "_Service"] = {}
+_config_caches: Dict[str, Dict[str, Any]] = {}
+_evidence_paths: Dict[str, Path] = {}
 
 
 # ────────────────────────────── profile-scoped plumbing ──────────────────────────────
@@ -83,6 +85,10 @@ _evidence_path: Optional[Path] = None
 def _home() -> Path:
     from hermes_constants import get_hermes_home
     return Path(get_hermes_home())
+
+
+def _home_key() -> str:
+    return str(_home())
 
 
 def _secret(name: str) -> str:
@@ -130,7 +136,9 @@ def _buzz_extra() -> dict:
 def _enabled() -> bool:
     """``display.platforms.buzz.observer_activity`` — default off, re-read every 60 s."""
     now = time.monotonic()
+    hk = _home_key()
     with _state_lock:
+        _config_cache = _config_caches.setdefault(hk, {"at": 0.0, "value": False})
         if now - float(_config_cache["at"]) < CONFIG_TTL:
             return bool(_config_cache["value"])
     value = False
@@ -142,24 +150,31 @@ def _enabled() -> bool:
         raw = node.get("observer_activity", False)
         value = str(raw).strip().lower() in ("true", "1", "yes", "on")
     except Exception:
-        if not _config_cache.get("warned"):
+        _cc = _config_caches.setdefault(hk, {"at": 0.0, "value": False})
+        if not _cc.get("warned"):
             logger.warning("buzz-observer: could not read observer_activity; staying off", exc_info=True)
-            _config_cache["warned"] = True
+            _cc["warned"] = True
         value = False
     with _state_lock:
+        _config_cache = _config_caches.setdefault(hk, {"at": 0.0, "value": False})
         _config_cache["at"] = now
         _config_cache["value"] = value
     return value
 
 
-def _evidence(message: dict) -> None:
-    """Append one line to ``logs/buzz-observer-frames.jsonl`` (best effort, never raises)."""
-    global _evidence_path
+def _evidence(message: dict, home: Optional[str] = None) -> None:
+    """Append one line to ``<profile home>/logs/buzz-observer-frames.jsonl`` (best effort).
+
+    The publisher thread has no profile scope, so it passes its own ``home``.
+    """
     try:
-        if _evidence_path is None:
-            _evidence_path = _home() / "logs" / "buzz-observer-frames.jsonl"
-            _evidence_path.parent.mkdir(parents=True, exist_ok=True)
-        with _evidence_path.open("a", encoding="utf-8") as fh:
+        hk = home or _home_key()
+        path = _evidence_paths.get(hk)
+        if path is None:
+            path = Path(hk) / "logs" / "buzz-observer-frames.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _evidence_paths[hk] = path
+        with path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(message, separators=(",", ":")) + "\n")
     except Exception:
         pass
@@ -250,6 +265,7 @@ def _new_ctx(session_id: str, channel: str, *, event_id: Optional[str] = None) -
         "last": time.time(),
         "eventIds": [event_id] if event_id else [],
         "announced": False,
+        "home": _home_key(),
     }
 
 
@@ -265,10 +281,10 @@ def _ctx_for(session_id: str, channel: str = "") -> dict:
             return ctx
         if pending_key and pending_key in _PENDING:
             ctx = _PENDING.pop(pending_key)
-        elif len(_PENDING) == 1:
-            only_key, only_ctx = next(iter(_PENDING.items()))
-            if time.time() - float(only_ctx.get("last", 0)) < 120.0:
-                ctx = _PENDING.pop(only_key)
+        else:
+            mine = [(k, c) for k, c in _PENDING.items() if c.get("home") == _home_key()]
+            if len(mine) == 1 and time.time() - float(mine[0][1].get("last", 0)) < 120.0:
+                ctx = _PENDING.pop(mine[0][0])
         if ctx is None:
             resolved = channel or _buzz_channel_for_session(session_id) or _cron_channel_for_session(session_id)
             if not resolved:
@@ -280,7 +296,7 @@ def _ctx_for(session_id: str, channel: str = "") -> dict:
         return ctx
 
 
-def _live_turns() -> List[dict]:
+def _live_turns(home: Optional[str] = None) -> List[dict]:
     now = time.time()
     out: List[dict] = []
     with _state_lock:
@@ -288,7 +304,8 @@ def _live_turns() -> List[dict]:
             if now - float(ctx.get("last", 0)) > TURN_TTL:
                 _TURNS.pop(session_id, None)
                 continue
-            out.append(dict(ctx))
+            if home is None or ctx.get("home") == home:
+                out.append(dict(ctx))
         for key, ctx in list(_PENDING.items()):
             if now - float(ctx.get("last", 0)) > TURN_TTL:
                 _PENDING.pop(key, None)
@@ -362,7 +379,8 @@ class _Service:
     """One publisher per profile: dedicated thread + asyncio loop + NIP-42 socket."""
 
     def __init__(self, *, relay_url: str, private_key: str, auth_tag: str,
-                 self_pubkey: str, owner_pubkey: str) -> None:
+                 self_pubkey: str, owner_pubkey: str, home: str = "") -> None:
+        self._home = home
         self._relay = relay_url
         self._key = private_key
         self._tag = auth_tag
@@ -444,7 +462,7 @@ class _Service:
                 logger.debug("buzz-observer: frame send failed: %s", exc)
                 _evidence({"ts": _rfc3339(), "kind": frame.get("kind"), "seq": frame.get("seq"),
                            "channelId": frame.get("channelId"), "verdict": "send_failed",
-                           "error": str(exc)[:200]})
+                           "error": str(exc)[:200]}, self._home)
 
     def _next_seq(self) -> int:
         self._seq += 1
@@ -502,7 +520,7 @@ class _Service:
                         "sessionId": info["sessionId"], "turnId": info["turnId"],
                         "verdict": "OK true" if accepted else "OK false",
                         "relay": str(message[3] if len(message) > 3 else "")[:200],
-                    })
+                    }, self._home)
                 elif message[0] in ("NOTICE", "CLOSED"):
                     logger.info("buzz-observer: relay %s: %s", message[0], message[-1])
         except asyncio.CancelledError:
@@ -544,7 +562,7 @@ class _Service:
         while True:
             await asyncio.sleep(LIVENESS_INTERVAL)
             try:
-                for ctx in _live_turns():
+                for ctx in _live_turns(self._home):
                     if ctx.get("channelId"):
                         self.submit(_frame("turn_liveness", ctx, {"status": "working"}))
             except Exception:
@@ -567,12 +585,14 @@ class _Service:
 
 def _service_instance() -> Optional[_Service]:
     """Lazily build the publisher for THIS profile; None when the feature is off/unconfigured."""
-    global _service
-    if _service is not None:
-        return _service
+    hk = _home_key()
+    existing = _services.get(hk)
+    if existing is not None:
+        return existing
     with _state_lock:
-        if _service is not None:
-            return _service
+        existing = _services.get(hk)
+        if existing is not None:
+            return existing
         if not _enabled():
             return None
         relay = (_secret("BUZZ_RELAY_URL") or str(_buzz_extra().get("relay_url") or "")).strip()
@@ -595,12 +615,12 @@ def _service_instance() -> Optional[_Service]:
                 return None
             relay_url = relay.replace("https://", "wss://").replace("http://", "ws://")
             service = _Service(relay_url=relay_url, private_key=key, auth_tag=tag,
-                               self_pubkey=self_pubkey, owner_pubkey=owner)
+                               self_pubkey=self_pubkey, owner_pubkey=owner, home=hk)
             service.start()
-            _service = service
+            _services[hk] = service
             logger.info("buzz-observer: publisher up (self=%s… owner=%s… relay=%s)",
                         self_pubkey[:12], owner[:12], relay_url)
-            return _service
+            return service
         except Exception:
             logger.warning("buzz-observer: publisher could not start", exc_info=True)
             return None

@@ -141,6 +141,60 @@ def test_channel_arms(obs, expect_cron: str) -> None:
     print("session arm:", obs._buzz_channel_for_session.__name__, "available")
 
 
+def test_two_profiles(obs) -> None:
+    """One process, two seats: each must get its own publisher, key and evidence file."""
+    import tempfile
+    import nostr_auth
+    root = Path(tempfile.mkdtemp(prefix="obs-two-"))
+    homes = {"a": root / "a", "b": root / "b"}
+    keys = {"a": "11" * 32, "b": "33" * 32}
+    owner = nostr_auth.public_key_hex("22" * 32)
+    current = {"p": "a"}
+    started = {}
+
+    class Stub:
+        def __init__(self, **kw):
+            self.kw = kw
+            started[kw["home"]] = kw["self_pubkey"]
+        def start(self):
+            pass
+
+    obs._home = lambda: homes[current["p"]]
+    obs._enabled = lambda: True
+    obs._secret = lambda name: {"BUZZ_RELAY_URL": "wss://x.invalid", "BUZZ_PRIVATE_KEY": keys[current["p"]],
+                                "BUZZ_AUTH_TAG": "unused"}[name]
+    real_parse = nostr_auth.parse_auth_tag
+    nostr_auth.parse_auth_tag = lambda tag, name: ("x", owner)
+    obs._Service = Stub
+    try:
+        svcs = {}
+        for p in ("a", "b"):
+            current["p"] = p
+            svcs[p] = obs._service_instance()
+        assert svcs["a"] is not svcs["b"], "profiles share one publisher"
+        assert svcs["a"].kw["self_pubkey"] != svcs["b"].kw["self_pubkey"], "profiles share one signing key"
+        assert svcs["a"].kw["self_pubkey"] == nostr_auth.public_key_hex(keys["a"])
+        current["p"] = "a"
+        assert obs._service_instance() is svcs["a"], "same profile must reuse its publisher"
+        for p in ("a", "b"):
+            current["p"] = p
+            obs._evidence({"p": p})
+        for p in ("a", "b"):
+            lines = (homes[p] / "logs" / "buzz-observer-frames.jsonl").read_text().splitlines()
+            assert lines == [json.dumps({"p": p}, separators=(",", ":"))], (p, lines)
+        # admission pending ctx of seat A must not be adopted by seat B
+        current["p"] = "a"
+        ctx_a = obs._new_ctx("sa", "chan-a")
+        obs._PENDING["ka"] = ctx_a
+        current["p"] = "b"
+        assert ctx_a["home"] == str(homes["a"])
+        assert all(c.get("home") != str(homes["b"]) for c in obs._live_turns(str(homes["b"])))
+        obs._PENDING.clear()
+        print("two-profiles: separate publishers, keys, evidence files, pending ctx — ok")
+    finally:
+        nostr_auth.parse_auth_tag = real_parse
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--vectors", default="/opt/data/profiles/goose/cache/scratch/nip44.vectors.json")
@@ -154,6 +208,7 @@ def main() -> int:
     test_hooks(obs, args.channel, "20261104_234002_298685f2")
     obs2 = _load_observer()
     test_rate_limit_via(obs2)
+    test_two_profiles(_load_observer())
     print("ALL OFFLINE CHECKS PASSED")
     return 0
 

@@ -1,4 +1,4 @@
-#!/bin/sh
+
 python3 selftest.py
 
 ## Rollout
